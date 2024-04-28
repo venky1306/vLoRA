@@ -97,10 +97,9 @@ def get_local_version_suffix() -> str:
 
 
 def get_version() -> str:
-    if version is None:
-        with open(root / "version.txt") as f:
-            version = f.read().strip()
-        version += get_local_version_suffix()
+    with open(root / "version.txt") as f:
+        version = f.read().strip()
+    version += get_local_version_suffix()
     return version
 
 
