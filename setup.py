@@ -97,7 +97,6 @@ def get_local_version_suffix() -> str:
 
 
 def get_version() -> str:
-    version = os.getenv("PUNICA_BUILD_VERSION")
     if version is None:
         with open(root / "version.txt") as f:
             version = f.read().strip()
