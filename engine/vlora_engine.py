@@ -329,7 +329,6 @@ def main():
     model_dir = project_root / "model"
     lora_specs = {}
     
-    print(logic)
     print(model_dir)
     print(project_root)
     print("-----------------------")
@@ -346,6 +345,7 @@ def main():
 
     print("-----------------------")
     print(lora_specs)
+    print(logic)
     
     # def append_box(box_id, text):
     #     tui.post_message(MultiLoraTui.AppendBox(box_id, text))
