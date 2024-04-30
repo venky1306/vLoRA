@@ -423,6 +423,7 @@ def main():
     tui.run()
     logic.stop()
     thread.join()
+    print(logic.counter)
 
 
 DEMO["gsm8k"] = DemoSpec(
