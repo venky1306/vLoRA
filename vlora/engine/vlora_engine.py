@@ -328,10 +328,6 @@ def main():
     project_root = pathlib.Path(__file__).parents[1]
     model_dir = project_root / "model"
     lora_specs = {}
-    
-    print(model_dir)
-    print(project_root)
-    print("-----------------------")
 
     for name, spec in DEMO.items():
         weight_path = spec.download(model_dir)
