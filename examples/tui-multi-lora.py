@@ -283,7 +283,7 @@ class MultiLora:
                     append_box(f"{model_name}-{lora_or_base}", "\n------\n\n")
                     self._delete_request(model_name, lora_or_base)
                     self._create_request(model_name, lora_or_base)
-                    if (model_name, lora_or_base) in reqctx:
+                    if (model_name, lora_or_base) in self.reqctx:
                         append_box(
                             f"{model_name}-{lora_or_base}",
                             self.reqctx[(model_name, lora_or_base)].decode_tokens(),
