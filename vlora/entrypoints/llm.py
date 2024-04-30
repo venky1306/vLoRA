@@ -1,254 +1,278 @@
-from typing import List, Optional, Union
+import dataclasses
+import pathlib
+import threading
+import time
+from collections.abc import Callable
 
+import numpy as np
 import torch
-from tqdm import tqdm
-from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
+import transformers
 
-from vllm.engine.arg_utils import EngineArgs
-from vllm.engine.llm_engine import LLMEngine
-from vllm.lora.request import LoRARequest
-from vllm.outputs import RequestOutput
-from vllm.sampling_params import SamplingParams
-from vllm.sequence import MultiModalData
-from vllm.usage.usage_lib import UsageContext
-from vllm.utils import Counter
+from punica import (
+    BatchedKvCache,
+    BatchedLlamaLoraWeight,
+    BatchLenInfo,
+    KvCache,
+    KvPool,
+    LlamaForCausalLMWithLora,
+    LlamaLoraWeight,
+)
 
 
-class LLM:
-    """An LLM for generating texts from given prompts and sampling parameters.
-
-    This class includes a tokenizer, a language model (possibly distributed
-    across multiple GPUs), and GPU memory space allocated for intermediate
-    states (aka KV cache). Given a batch of prompts and sampling parameters,
-    this class generates texts from the model, using an intelligent batching
-    mechanism and efficient memory management.
-
-    NOTE: This class is intended to be used for offline inference. For online
-    serving, use the `AsyncLLMEngine` class instead.
-    NOTE: For the comprehensive list of arguments, see `EngineArgs`.
-
-    Args:
-        model: The name or path of a HuggingFace Transformers model.
-        tokenizer: The name or path of a HuggingFace Transformers tokenizer.
-        tokenizer_mode: The tokenizer mode. "auto" will use the fast tokenizer
-            if available, and "slow" will always use the slow tokenizer.
-        skip_tokenizer_init: If true, skip initialization of tokenizer and
-            detokenizer. Expect valid prompt_token_ids and None for prompt
-            from the input.
-        trust_remote_code: Trust remote code (e.g., from HuggingFace) when
-            downloading the model and tokenizer.
-        tensor_parallel_size: The number of GPUs to use for distributed
-            execution with tensor parallelism.
-        dtype: The data type for the model weights and activations. Currently,
-            we support `float32`, `float16`, and `bfloat16`. If `auto`, we use
-            the `torch_dtype` attribute specified in the model config file.
-            However, if the `torch_dtype` in the config is `float32`, we will
-            use `float16` instead.
-        quantization: The method used to quantize the model weights. Currently,
-            we support "awq", "gptq", "squeezellm", and "fp8" (experimental).
-            If None, we first check the `quantization_config` attribute in the
-            model config file. If that is None, we assume the model weights are
-            not quantized and use `dtype` to determine the data type of
-            the weights.
-        revision: The specific model version to use. It can be a branch name,
-            a tag name, or a commit id.
-        tokenizer_revision: The specific tokenizer version to use. It can be a
-            branch name, a tag name, or a commit id.
-        seed: The seed to initialize the random number generator for sampling.
-        gpu_memory_utilization: The ratio (between 0 and 1) of GPU memory to
-            reserve for the model weights, activations, and KV cache. Higher
-            values will increase the KV cache size and thus improve the model's
-            throughput. However, if the value is too high, it may cause out-of-
-            memory (OOM) errors.
-        swap_space: The size (GiB) of CPU memory per GPU to use as swap space.
-            This can be used for temporarily storing the states of the requests
-            when their `best_of` sampling parameters are larger than 1. If all
-            requests will have `best_of=1`, you can safely set this to 0.
-            Otherwise, too small values may cause out-of-memory (OOM) errors.
-        enforce_eager: Whether to enforce eager execution. If True, we will
-            disable CUDA graph and always execute the model in eager mode.
-            If False, we will use CUDA graph and eager execution in hybrid.
-        max_context_len_to_capture: Maximum context len covered by CUDA graphs.
-            When a sequence has context length larger than this, we fall back
-            to eager mode.
-        disable_custom_all_reduce: See ParallelConfig
-    """
-
+class TextGeneration:
     def __init__(
         self,
-        model: str,
-        tokenizer: Optional[str] = None,
-        tokenizer_mode: str = "auto",
-        skip_tokenizer_init: bool = False,
-        trust_remote_code: bool = False,
-        tensor_parallel_size: int = 1,
-        dtype: str = "auto",
-        quantization: Optional[str] = None,
-        revision: Optional[str] = None,
-        tokenizer_revision: Optional[str] = None,
-        seed: int = 0,
-        gpu_memory_utilization: float = 0.9,
-        swap_space: int = 4,
-        enforce_eager: bool = False,
-        max_context_len_to_capture: int = 8192,
-        disable_custom_all_reduce: bool = False,
-        **kwargs,
-    ) -> None:
-        if "disable_log_stats" not in kwargs:
-            kwargs["disable_log_stats"] = True
-        engine_args = EngineArgs(
-            model=model,
-            tokenizer=tokenizer,
-            tokenizer_mode=tokenizer_mode,
-            skip_tokenizer_init=skip_tokenizer_init,
-            trust_remote_code=trust_remote_code,
-            tensor_parallel_size=tensor_parallel_size,
-            dtype=dtype,
-            quantization=quantization,
-            revision=revision,
-            tokenizer_revision=tokenizer_revision,
-            seed=seed,
-            gpu_memory_utilization=gpu_memory_utilization,
-            swap_space=swap_space,
-            enforce_eager=enforce_eager,
-            max_context_len_to_capture=max_context_len_to_capture,
-            disable_custom_all_reduce=disable_custom_all_reduce,
-            **kwargs,
-        )
-        self.llm_engine = LLMEngine.from_engine_args(
-            engine_args, usage_context=UsageContext.LLM_CLASS)
-        self.request_counter = Counter()
+        input_ids: list[int],
+        kvpool: KvPool,
+        lora_id: str,
+        tokenizer,
+        *,
+        temperature: float,
+        repetition_penalty: float,
+        top_p: float,
+        top_k: int,
+        maxlen: int,
+        stop_token_id: int,
+    ):
+        self.temperature = temperature
+        self.repetition_penalty = repetition_penalty
+        self.top_p = top_p
+        self.top_k = top_k
+        self.maxlen = maxlen
+        self.stop_token_id = stop_token_id
 
-    def get_tokenizer(
-            self) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
-        return self.llm_engine.tokenizer.tokenizer
-
-    def set_tokenizer(
-        self,
-        tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
-    ) -> None:
-        self.llm_engine.tokenizer.tokenizer = tokenizer
-
-    def generate(
-        self,
-        prompts: Optional[Union[str, List[str]]] = None,
-        sampling_params: Optional[Union[SamplingParams,
-                                        List[SamplingParams]]] = None,
-        prompt_token_ids: Optional[List[List[int]]] = None,
-        use_tqdm: bool = True,
-        lora_request: Optional[LoRARequest] = None,
-        multi_modal_data: Optional[MultiModalData] = None,
-    ) -> List[RequestOutput]:
-        """Generates the completions for the input prompts.
-
-        NOTE: This class automatically batches the given prompts, considering
-        the memory constraint. For the best performance, put all of your prompts
-        into a single list and pass it to this method.
-
-        Args:
-            prompts: A list of prompts to generate completions for.
-            sampling_params: The sampling parameters for text generation. If
-                None, we use the default sampling parameters. 
-                When it is a single value, it is applied to every prompt. 
-                When it is a list, the list must have the same length as the 
-                prompts and it is paired one by one with the prompt.
-            prompt_token_ids: A list of token IDs for the prompts. If None, we
-                use the tokenizer to convert the prompts to token IDs.
-            use_tqdm: Whether to use tqdm to display the progress bar.
-            lora_request: LoRA request to use for generation, if any.
-            multi_modal_data: Multi modal data.
-
-        Returns:
-            A list of `RequestOutput` objects containing the generated
-            completions in the same order as the input prompts.
-        """
-        if prompts is None and prompt_token_ids is None:
-            raise ValueError("Either prompts or prompt_token_ids must be "
-                             "provided.")
-        if self.llm_engine.model_config.skip_tokenizer_init \
-            and prompts is not None:
-            raise ValueError("prompts must be None if skip_tokenizer_init "
-                             "is True")
-        if isinstance(prompts, str):
-            # Convert a single prompt to a list.
-            prompts = [prompts]
-        if (prompts is not None and prompt_token_ids is not None
-                and len(prompts) != len(prompt_token_ids)):
-            raise ValueError("The lengths of prompts and prompt_token_ids "
-                             "must be the same.")
-
-        if prompts is not None:
-            num_requests = len(prompts)
-        else:
-            assert prompt_token_ids is not None
-            num_requests = len(prompt_token_ids)
-
-        if sampling_params is None:
-            # Use default sampling params.
-            sampling_params = SamplingParams()
-
-        elif isinstance(sampling_params,
-                        list) and len(sampling_params) != num_requests:
-            raise ValueError("The lengths of prompts and sampling_params "
-                             "must be the same.")
-        if multi_modal_data:
-            multi_modal_data.data = multi_modal_data.data.to(torch.float16)
-
-        # Add requests to the engine.
-        for i in range(num_requests):
-            prompt = prompts[i] if prompts is not None else None
-            token_ids = None if prompt_token_ids is None else prompt_token_ids[
-                i]
-            self._add_request(
-                prompt,
-                sampling_params[i]
-                if isinstance(sampling_params, list) else sampling_params,
-                token_ids,
-                lora_request=lora_request,
-                # Get ith image while maintaining the batch dim.
-                multi_modal_data=MultiModalData(
-                    type=multi_modal_data.type,
-                    data=multi_modal_data.data[i].unsqueeze(0))
-                if multi_modal_data else None,
+        # Logits processing adapted from: https://github.com/lm-sys/FastChat/blob/bb7ca37c2bfad629ba4751dec188bdcdc2cf0c81/fastchat/serve/inference.py
+        self.logits_processor = transformers.LogitsProcessorList()
+        if temperature > 0 and temperature != 1.0:
+            self.logits_processor.append(
+                transformers.TemperatureLogitsWarper(temperature)
             )
-        return self._run_engine(use_tqdm)
+        if repetition_penalty > 1.0:
+            self.logits_processor.append(
+                transformers.RepetitionPenaltyLogitsProcessor(repetition_penalty)
+            )
+        if 0 < top_p < 1.0:
+            self.logits_processor.append(transformers.TopPLogitsWarper(top_p))
+        if top_k > 0:
+            self.logits_processor.append(transformers.TopKLogitsWarper(top_k))
 
-    def _add_request(
+        self.output_ids = [int(x) for x in input_ids]
+        self.prompt_len = len(self.output_ids)
+        self.kvcache = KvCache(kvpool, self.prompt_len)
+        self.lora_id = lora_id
+        self.tokenizer = tokenizer
+        self.prefix_offset = 0
+        self.read_offset = 0
+
+    def get_next_token_id(self, logits: torch.Tensor) -> int:
+        if self.logits_processor:
+            if self.repetition_penalty > 1.0:
+                t = torch.as_tensor([self.output_ids], device=logits.device)
+            else:
+                t = None
+            last_token_logits = self.logits_processor(t, logits[-1].unsqueeze(0))[0]
+        else:
+            last_token_logits = logits[-1, :]
+
+        if self.temperature <= 0 or self.top_p <= 0:
+            _, indices = torch.topk(last_token_logits, 2)
+        else:
+            probs = torch.softmax(last_token_logits, dim=-1)
+            indices = torch.multinomial(probs, num_samples=2)
+        token = int(indices.tolist()[0])
+        return token
+
+    def append_token(self, token_id: int):
+        self.output_ids.append(token_id)
+
+    def is_stop(self) -> int:
+        if len(self.output_ids) >= self.maxlen:
+            return True
+        if self.output_ids[-1] == self.stop_token_id:
+            return True
+        return False
+
+    def is_prefill(self) -> bool:
+        return len(self.output_ids) == self.prompt_len
+
+    def decode_tokens(self) -> str:
+        # Adapted from: https://github.com/huggingface/text-generation-inference/blob/a5def7c222174e03d815f890093584f3e815c5ce/server/text_generation_server/models/model.py#L68
+        prefix_text = self.tokenizer.decode(
+            self.output_ids[self.prefix_offset : self.read_offset],
+            skip_special_tokens=True,
+        )
+        new_text = self.tokenizer.decode(
+            self.output_ids[self.prefix_offset :], skip_special_tokens=True
+        )
+        if len(new_text) > len(prefix_text) and not new_text.endswith("\uFFFD"):
+            new_text = new_text[len(prefix_text) :]
+            self.prefix_offset = self.read_offset
+            self.read_offset = len(self.output_ids)
+            return new_text
+        else:
+            return ""
+
+
+@dataclasses.dataclass
+class LoraSpec:
+    weight_path: pathlib.Path
+    lora_prompts: list[str]
+    base_prompts: list[str]
+
+
+class MultiLora:
+    def __init__(self, lora_specs: dict[str, LoraSpec]):
+        self.dtype = torch.float16
+        self.device = torch.device("cuda:0")
+        self.base_model = "meta-llama/Llama-2-7b-hf"
+        self.maxlen = 1024
+        self.lora_specs = lora_specs
+        self.stop_signal = threading.Event()
+
+        # Load base model
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+            self.base_model, use_fast=True
+        )
+        model_config = transformers.LlamaConfig.from_pretrained(self.base_model)
+        self.model = LlamaForCausalLMWithLora.from_pretrained(
+            self.base_model, low_cpu_mem_usage=True, torch_dtype=self.dtype
+        ).to(self.device)
+        self.kvpool = KvPool(
+            num_layers=model_config.num_hidden_layers,
+            num_heads=model_config.num_attention_heads,
+            head_dim=model_config.hidden_size // model_config.num_attention_heads,
+            page_len=16,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        # Load LoRA weights
+        self.lora_weights = {}
+        for model_name, spec in lora_specs.items():
+            tmp = torch.load(
+                spec.weight_path, map_location=self.device, weights_only=True
+            )
+            lora_rank = tmp["q.A"].size(1)
+            lora_weight = LlamaLoraWeight(
+                model_config, lora_rank, self.dtype, self.device
+            )
+            lora_weight.copy_from_tensors(tmp)
+            del tmp
+            self.lora_weights[model_name] = lora_weight
+        self.lora_weights["empty"] = LlamaLoraWeight(
+            model_config, lora_rank, self.dtype, self.device
+        )
+        self.counter = len(lora_specs) * 2;
+        self.req_counter: dict[tuple[str, str], int] = {}
+        # Create text generation requests
+        self.reqctx: dict[tuple[str, str], TextGeneration] = {}
+        for model_name in lora_specs:
+            for lora_or_base in ["lora", "base"]:
+                self.req_counter[(model_name, lora_or_base)] = 0;
+                self._create_request(model_name, lora_or_base)
+
+    def _create_request(self, model_name: str, lora_or_base: str):
+        if lora_or_base == "lora":
+            prompts = self.lora_specs[model_name].lora_prompts
+            lora_id = model_name
+        elif lora_or_base == "base":
+            prompts = self.lora_specs[model_name].base_prompts
+            lora_id = "empty"
+        else:
+            raise ValueError(f"Unknown lora_or_base={lora_or_base}")
+        if(self.req_counter[(model_name, lora_or_base)] >= len(prompts)):
+            self.counter -= 1
+            return
+        input_ids = self.tokenizer.encode(prompts[self.req_counter[(model_name, lora_or_base)]])
+        self.req_counter[(model_name, lora_or_base)] += 1
+        textgen = TextGeneration(
+            input_ids=input_ids,
+            kvpool=self.kvpool,
+            lora_id=lora_id,
+            tokenizer=self.tokenizer,
+            temperature=0.9,
+            repetition_penalty=1.1,
+            top_p=0.9,
+            top_k=-1,
+            maxlen=self.maxlen,
+            stop_token_id=self.tokenizer.eos_token_id,
+        )
+        self.reqctx[(model_name, lora_or_base)] = textgen
+
+    def _delete_request(
         self,
-        prompt: Optional[str],
-        sampling_params: SamplingParams,
-        prompt_token_ids: Optional[List[int]],
-        lora_request: Optional[LoRARequest] = None,
-        multi_modal_data: Optional[MultiModalData] = None,
-    ) -> None:
-        request_id = str(next(self.request_counter))
-        self.llm_engine.add_request(request_id,
-                                    prompt,
-                                    sampling_params,
-                                    prompt_token_ids,
-                                    lora_request=lora_request,
-                                    multi_modal_data=multi_modal_data)
+        model_name: str,
+        lora_or_base: str,
+    ):
+        reqctx = self.reqctx[(model_name, lora_or_base)]
+        reqctx.kvcache.release()
+        del self.reqctx[(model_name, lora_or_base)]
 
-    def _run_engine(self, use_tqdm: bool) -> List[RequestOutput]:
-        # Initialize tqdm.
-        if use_tqdm:
-            num_requests = self.llm_engine.get_num_unfinished_requests()
-            pbar = tqdm(total=num_requests,
-                        desc="Processed prompts",
-                        dynamic_ncols=True)
-        # Run the engine.
-        outputs: List[RequestOutput] = []
-        while self.llm_engine.has_unfinished_requests():
-            step_outputs = self.llm_engine.step()
-            for output in step_outputs:
-                if output.finished:
-                    outputs.append(output)
-                    if use_tqdm:
-                        pbar.update(1)
-        if use_tqdm:
-            pbar.close()
-        # Sort the outputs by request ID.
-        # This is necessary because some requests may be finished earlier than
-        # its previous requests.
-        outputs = sorted(outputs, key=lambda x: int(x.request_id))
-        return outputs
+    def stop(self):
+        self.stop_signal.set()
+
+    def run(self):
+        time.sleep(0.1)
+        for (model_name, lora_or_base), reqctx in self.reqctx.items():
+            append_box(f"{model_name}-{lora_or_base}", reqctx.decode_tokens())
+
+        while self.counter>0:
+            # Put prefill requests first, then sort by lora_id.
+            reqs = sorted(
+                self.reqctx.items(),
+                key=lambda kv: (not kv[1].is_prefill(), kv[1].lora_id),
+            )
+
+            # Gather batch
+            prefill_input_ids, prefill_lens, prefill_kv = [], [], []
+            decode_input_ids, decode_kv = [], []
+            lora_ids, lora_lens = [], []
+            for _, reqctx in reqs:
+                if reqctx.is_prefill():
+                    prefill_input_ids.extend(reqctx.output_ids)
+                    prefill_lens.append(len(reqctx.output_ids))
+                    prefill_kv.append(reqctx.kvcache)
+                else:
+                    decode_input_ids.append(reqctx.output_ids[-1])
+                    decode_kv.append(reqctx.kvcache)
+                    reqctx.kvcache.acquire_one()
+                if lora_ids and lora_ids[-1] == reqctx.lora_id:
+                    lora_lens[-1] += 1
+                else:
+                    lora_ids.append(reqctx.lora_id)
+                    lora_lens.append(1)
+
+            # Run model
+            input_ids = torch.tensor(
+                prefill_input_ids + decode_input_ids,
+                dtype=torch.long,
+                device=self.device,
+            )
+            blen = BatchLenInfo(prefill_lens, len(decode_input_ids), self.device)
+            prefill_kv = BatchedKvCache(prefill_kv) if prefill_kv else None
+            decode_kv = BatchedKvCache(decode_kv) if decode_kv else None
+            lora = BatchedLlamaLoraWeight(
+                [self.lora_weights[id] for id in lora_ids], lora_lens
+            )
+            logits, _ = self.model(input_ids, blen, prefill_kv, decode_kv, lora)
+            if prefill_kv:
+                if decode_kv:
+                    logits = torch.cat(
+                        [logits[blen.indptr[1:] - 1], logits[blen.doff :]]
+                    )
+                else:
+                    logits = logits[blen.indptr[1:] - 1]
+
+            # Postprocess
+            for i, ((model_name, lora_or_base), reqctx) in enumerate(reqs):
+                next_token_id = reqctx.get_next_token_id(logits[i].unsqueeze(0))
+                reqctx.append_token(next_token_id)
+                append_box(f"{model_name}-{lora_or_base}", reqctx.decode_tokens())
+                if reqctx.is_stop():
+                    append_box(f"{model_name}-{lora_or_base}", "\n------\n\n")
+                    self._delete_request(model_name, lora_or_base)
+                    self._create_request(model_name, lora_or_base)
+                    append_box(
+                        f"{model_name}-{lora_or_base}",
+                        self.reqctx[(model_name, lora_or_base)].decode_tokens(),
+                    )
