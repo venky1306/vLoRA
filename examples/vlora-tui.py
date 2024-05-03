@@ -317,10 +317,10 @@ class MultiLoraTui(App):
     overflow-y: auto;
     scrollbar-size: 1 1;
     color: white; 
-    background-color: blue; 
+    background: hsl(240, 100%, 50%); 
 """
 
-    TITLE = "Punica Multi-LoRA serving demo"
+    TITLE = "vLORA Multi-LoRA serving demo"
 
     BINDINGS = [
         Binding(key="q", action="quit", description="Quit"),
