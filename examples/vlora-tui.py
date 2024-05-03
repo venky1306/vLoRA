@@ -317,7 +317,8 @@ class MultiLoraTui(App):
     overflow-y: auto;
     scrollbar-size: 1 1;
     color: white; 
-    background: hsl(240, 100%, 50%); 
+    background: blue; 
+}
 """
 
     TITLE = "vLORA Multi-LoRA serving demo"
