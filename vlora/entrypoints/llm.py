@@ -1,8 +1,6 @@
 import dataclasses
 import pathlib
-import threading
 import time
-from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -121,13 +119,12 @@ class LoraSpec:
 
 
 class MultiLora:
-    def __init__(self, lora_specs: dict[str, LoraSpec]):
+    def __init__(self, model: str, lora_specs: dict[str, LoraSpec], dtype: torch.float16):
         self.dtype = torch.float16
         self.device = torch.device("cuda:0")
-        self.base_model = "meta-llama/Llama-2-7b-hf"
+        self.base_model = model
         self.maxlen = 1024
         self.lora_specs = lora_specs
-        self.stop_signal = threading.Event()
 
         # Load base model
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -208,10 +205,7 @@ class MultiLora:
         reqctx.kvcache.release()
         del self.reqctx[(model_name, lora_or_base)]
 
-    def stop(self):
-        self.stop_signal.set()
-
-    def run(self):
+    def generate(self):
         time.sleep(0.1)
         for (model_name, lora_or_base), reqctx in self.reqctx.items():
             append_box(f"{model_name}-{lora_or_base}", reqctx.decode_tokens())
@@ -272,7 +266,9 @@ class MultiLora:
                     append_box(f"{model_name}-{lora_or_base}", "\n------\n\n")
                     self._delete_request(model_name, lora_or_base)
                     self._create_request(model_name, lora_or_base)
-                    append_box(
-                        f"{model_name}-{lora_or_base}",
-                        self.reqctx[(model_name, lora_or_base)].decode_tokens(),
-                    )
+                    if (model_name, lora_or_base) in self.reqctx:
+                        append_box(
+                            f"{model_name}-{lora_or_base}",
+                            self.reqctx[(model_name, lora_or_base)].decode_tokens(),
+                        )
+

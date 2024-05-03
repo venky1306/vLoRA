@@ -1,5 +1,7 @@
 import dataclasses
 import json
+import numpy as np
+import torch
 
 from vlora.entrypoints import MultiLora
 from vlora.entrypoints import LoraSpec
@@ -60,28 +62,9 @@ def main():
         weight_path = spec.download(model_dir)
         lora_prompts, base_prompts = spec.generate_prompts()
         lora_specs[name] = LoraSpec(weight_path, lora_prompts, base_prompts)
-        print(name, spec)
-        print("-----------------------")
 
-    logic = MultiLora(lora_specs)
-    # tui = MultiLoraTui(list(DEMO.keys()))
-
-    print("-----------------------")
-    print(lora_specs)
-    print(logic)
-    
-    # def append_box(box_id, text):
-    #     tui.post_message(MultiLoraTui.AppendBox(box_id, text))
-
-    # thread = threading.Thread(
-    #     target=logic.run,
-    #     args=(append_box,),
-    # )
-    # thread.start()
-    # tui.run()
-    # logic.stop()
-    # thread.join()
-
+    llm = MultiLora(model="meta-llama/Llama-2-7b-hf", lora_specs= lora_specs)
+    llm.generate()
 
 DEMO["gsm8k"] = DemoSpec(
     weight_url="https://huggingface.co/abcdabcd987/gsm8k-llama2-7b-lora-16/resolve/main/gsm8k-r16.punica.pt",

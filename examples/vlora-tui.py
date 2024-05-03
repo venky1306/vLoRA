@@ -280,7 +280,7 @@ class MultiLora:
                 reqctx.append_token(next_token_id)
                 append_box(f"{model_name}-{lora_or_base}", reqctx.decode_tokens())
                 if reqctx.is_stop():
-                    append_box(f"{model_name}-{lora_or_base}", "\n------\n\n")
+                    append_box(f"{model_name}-{lora_or_base}", "\n|-------------|\n\n")
                     self._delete_request(model_name, lora_or_base)
                     self._create_request(model_name, lora_or_base)
                     if (model_name, lora_or_base) in self.reqctx:
@@ -316,7 +316,8 @@ class MultiLoraTui(App):
     overflow-x: hidden;
     overflow-y: auto;
     scrollbar-size: 1 1;
-}
+    color: white; 
+    background-color: blue; 
 """
 
     TITLE = "Punica Multi-LoRA serving demo"
